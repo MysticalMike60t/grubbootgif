@@ -3,7 +3,7 @@ Set a GIF for Grub boot (like windows logo on startup).
 
 ## Install
 
-```
+```sh
 git clone https://github.com/MysticalMike60t/grubbootgif.git
 cd grubbootgif
 sudo install -m755 set-boot-gif /usr/local/bin/
