@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+THEME=mygif
+DIR=/usr/share/plymouth/themes/$THEME
+LOOP=0
+HEIGHT=1080
+FPS=""
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+usage() {
+    sed -n '2,8p' "$0" | sed 's/^# \?//'
+    printf '\n  -l          loop forever (default: play once)\n'
+    printf '  -H <px>     target height (default: %s)\n' "$HEIGHT"
+    printf '  -f <fps>    override playback rate (default: read from GIF)\n'
+    exit 1
+}
+
+while getopts 'lH:f:h' o; do
+    case $o in
+        l) LOOP=1 ;;
+        H) HEIGHT=$OPTARG ;;
+        f) FPS=$OPTARG ;;
+        *) usage ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+[ $# -eq 1 ] || usage
+GIF=$(realpath -e "$1") || die "no such file: $1"
+[ "$(id -u)" -eq 0 ] || die "must run as root"
+command -v ffmpeg  >/dev/null || die "ffmpeg not installed"
+command -v ffprobe >/dev/null || die "ffprobe not installed"
+command -v plymouth-set-default-theme >/dev/null || die "plymouth not installed"
+
+if [ -z "$FPS" ]; then
+    RAW=$(ffprobe -v error -select_streams v:0 \
+                  -show_entries stream=avg_frame_rate -of csv=p=0 "$GIF")
+    FPS=$(awk -F/ '{ r = ($2 ? $1/$2 : $1); printf "%d", (r < 1 ? 25 : r) }' <<<"$RAW")
+fi
+[ "$FPS" -ge 1 ] 2>/dev/null || die "bad fps: $FPS"
+[ "$FPS" -le 50 ] || FPS=50
+
+echo ":: extracting frames at ${HEIGHT}p / ${FPS}fps"
+rm -rf "$DIR"
+mkdir -p "$DIR"
+ffmpeg -loglevel error -i "$GIF" \
+       -vf "scale=-1:${HEIGHT}:flags=lanczos" \
+       "$DIR/frame-%03d.png"
+
+N=$(find "$DIR" -maxdepth 1 -name 'frame-*.png' | wc -l)
+[ "$N" -gt 0 ]   || die "ffmpeg produced no frames"
+[ "$N" -le 999 ] || die "$N frames exceeds the %03d naming limit — lower -f"
+
+cat > "$DIR/$THEME.plymouth" <<EOF
+[Plymouth Theme]
+Name=MyGif
+Description=Animated boot splash
+ModuleName=script
+
+[script]
+ImageDir=$DIR
+ScriptFile=$DIR/$THEME.script
+EOF
+
+cat > "$DIR/$THEME.script" <<EOF
+num_frames = $N;
+fps        = $FPS;
+loop       = $LOOP;
+
+Window.SetBackgroundTopColor(0,0,0);
+Window.SetBackgroundBottomColor(0,0,0);
+
+fun pad(n) {
+    if (n < 10)  return "00" + n;
+    if (n < 100) return "0"  + n;
+    return "" + n;
+}
+
+for (i = 1; i <= num_frames; i++)
+    frames[i] = Image("frame-" + pad(i) + ".png");
+
+sw = Window.GetWidth();
+sh = Window.GetHeight();
+iw = frames[1].GetWidth();
+ih = frames[1].GetHeight();
+
+scale = Math.Max(sw / iw, sh / ih);
+nw = Math.Int(iw * scale);
+nh = Math.Int(ih * scale);
+
+for (i = 1; i <= num_frames; i++)
+    frames[i] = frames[i].Scale(nw, nh);
+
+sprite = Sprite(frames[1]);
+sprite.SetX(sw / 2 - nw / 2);
+sprite.SetY(sh / 2 - nh / 2);
+
+step  = Math.Int(50 / fps);
+if (step < 1) step = 1;
+tick  = 0;
+frame = 1;
+done  = 0;
+
+fun refresh() {
+    if (done) return;
+    tick++;
+    if (tick < step) return;
+    tick = 0;
+    frame++;
+    if (frame > num_frames) {
+        if (loop) { frame = 1; }
+        else      { frame = num_frames; done = 1; return; }
+    }
+    sprite.SetImage(frames[frame]);
+}
+Plymouth.SetRefreshFunction(refresh);
+EOF
+
+echo ":: rebuilding initramfs"
+plymouth-set-default-theme "$THEME"
+mkinitcpio -P
+
+SECS=$(awk -v n="$N" -v f="$FPS" 'BEGIN { printf "%.1f", n/f }')
+MODE=$([ "$LOOP" -eq 1 ] && echo loop || echo "play once")
+printf '\n:: %s frames @ %sfps — %ss, %s\n' "$N" "$FPS" "$SECS" "$MODE"
+printf ':: theme %s / initramfs %s\n' \
+    "$(du -sh "$DIR" | cut -f1)" \
+    "$(du -h /boot/initramfs-linux.img 2>/dev/null | cut -f1)"
+printf ':: hold splash for the full run:\n'
+printf '     systemctl edit plymouth-quit.service  ->  ExecStartPre=/usr/bin/sleep %.0f\n' "$SECS"
+printf ':: preview: plymouthd --tty=/dev/tty1 && plymouth --show-splash && sleep %.0f && plymouth --quit\n' "$SECS"
